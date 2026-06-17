@@ -1,5 +1,10 @@
 const Redis = require('ioredis');
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL, {
+  family: 4, // Force IPv4, Vercel sometimes has issues with IPv6 routing to Redis
+  connectTimeout: 10000,
+});
+
+redis.on('error', (err) => console.error('Redis Client Error', err));
 
 module.exports = async (req, res) => {
   // Allow CORS for the desktop app if necessary, though desktop apps ignore CORS

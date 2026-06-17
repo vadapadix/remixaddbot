@@ -1,7 +1,12 @@
 const { Telegraf } = require('telegraf');
 const Redis = require('ioredis');
 
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL, {
+  family: 4, // Force IPv4
+  connectTimeout: 10000,
+});
+
+redis.on('error', (err) => console.error('Redis Client Error', err));
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
