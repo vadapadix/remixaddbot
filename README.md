@@ -1,14 +1,14 @@
 # REMIX Telegram Bot
 
 Цей бот створений для того, щоб передавати аудіофайли з Telegram безпосередньо у десктопний застосунок REMIX. 
-Він базується на Node.js та розгортається на Vercel (через Serverless Functions). Для зберігання тимчасових даних між запитами клієнта та телеграму використовується Vercel KV (Redis).
+Він базується на Node.js та розгортається на Vercel (через Serverless Functions). Для зберігання тимчасових даних між запитами клієнта та телеграму використовується Upstash Redis.
 
 ## Як це працює?
 1. Застосунок REMIX генерує унікальний ідентифікатор сесії (наприклад, `1167` або `GUID`).
 2. Користувач переходить за посиланням: `https://t.me/YourRemixBot?start=1167`.
 3. Застосунок REMIX починає опитувати API бота кожні 2-3 секунди за адресою: `https://your-vercel-app.vercel.app/api/getData?session=1167`.
 4. Користувач натискає "Start" у боті та відправляє аудіофайли.
-5. Бот отримує аудіофайли, витягує метадані та тимчасово зберігає їх у базі даних (Vercel KV).
+5. Бот отримує аудіофайли, витягує метадані та тимчасово зберігає їх у базі даних (Upstash Redis).
 6. Коли клієнт REMIX здійснює черговий запит до `/api/getData`, він отримує список пісень разом з прямими посиланнями на завантаження, після чого дані видаляються з бази.
 
 ## Як розгорнути на Vercel
@@ -27,10 +27,9 @@
 4. Пройдіть процес ініціалізації (виберіть поточну папку, налаштування за замовчуванням).
 5. Перейдіть у панель керування вашим проєктом на Vercel.
 
-### Крок 3. Налаштування Бази Даних (Vercel KV)
-1. У панелі проєкту на Vercel перейдіть до вкладки **Storage**.
-2. Натисніть **Create Database** і виберіть **KV (Redis)**.
-3. Пройдіть швидке створення. Після цього всі необхідні змінні оточення (KV_REST_API_URL, KV_REST_API_TOKEN тощо) будуть автоматично додані до вашого проєкту.
+### Крок 3. Налаштування Бази Даних (Redis)
+1. Оскільки ви вже маєте `REDIS_URL`, перейдіть у панелі проєкту Vercel до **Settings -> Environment Variables**.
+2. Створіть змінну `REDIS_URL` та вставте туди вашу стрічку: `redis://default:KEs1...`.
 
 ### Крок 4. Додавання Bot Token
 1. У панелі проєкту Vercel перейдіть до **Settings -> Environment Variables**.
@@ -59,8 +58,8 @@ using System.Threading.Tasks;
 public class TelegramImportService
 {
     private readonly HttpClient _httpClient = new HttpClient();
-    private const string VercelAppUrl = "https://your-vercel-app.vercel.app"; // Змініть на свій
-    private const string BotUsername = "YourRemixBot"; // Змініть на ім'я свого бота
+    private const string VercelAppUrl = "https://remix-telegram-bot.vercel.app"; // Адреса вашого Vercel
+    private const string BotUsername = "remixx_bot"; // Ваш Telegram бот
 
     public async Task StartImportFlowAsync()
     {

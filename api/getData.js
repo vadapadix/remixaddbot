@@ -1,4 +1,5 @@
-const { kv } = require('@vercel/kv');
+const Redis = require('ioredis');
+const redis = new Redis(process.env.REDIS_URL);
 const axios = require('axios'); // We can use axios or native fetch
 
 module.exports = async (req, res) => {
@@ -16,7 +17,13 @@ module.exports = async (req, res) => {
 
   try {
     const sessionKey = `session:${sessionId}`;
-    const songs = await kv.get(sessionKey);
+    const songsData = await redis.get(sessionKey);
+    let songs = [];
+    if (songsData) {
+        try {
+            songs = JSON.parse(songsData);
+        } catch(e) {}
+    }
 
     if (!songs || songs.length === 0) {
       return res.status(200).json({ songs: [] });
@@ -47,7 +54,7 @@ module.exports = async (req, res) => {
     }));
 
     // Clear the songs from the KV store so we don't download them twice
-    await kv.del(sessionKey);
+    await redis.del(sessionKey);
 
     return res.status(200).json({ songs: resolvedSongs });
   } catch (error) {
