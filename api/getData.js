@@ -1,6 +1,5 @@
 const Redis = require('ioredis');
 const redis = new Redis(process.env.REDIS_URL);
-const axios = require('axios'); // We can use axios or native fetch
 
 module.exports = async (req, res) => {
   // Allow CORS for the desktop app if necessary, though desktop apps ignore CORS
