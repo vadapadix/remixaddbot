@@ -50,10 +50,28 @@ module.exports = async (req, res) => {
         
         if (data.ok) {
           song.download_url = `https://api.telegram.org/file/bot${botToken}/${data.result.file_path}`;
+        } else {
+          console.error(`Telegram API getFile failed for file_id ${song.file_id}:`, data);
+          song.error = data.description || 'Unknown Telegram API error';
         }
       } catch (err) {
         console.error('Error fetching file path from Telegram:', err);
+        song.error = err.message;
       }
+
+      // Resolve thumbnail URL if present
+      if (song.thumb_file_id) {
+        try {
+          const thumbResp = await fetch(`https://api.telegram.org/bot${botToken}/getFile?file_id=${song.thumb_file_id}`);
+          const thumbData = await thumbResp.json();
+          if (thumbData.ok) {
+            song.thumb_url = `https://api.telegram.org/file/bot${botToken}/${thumbData.result.file_path}`;
+          }
+        } catch (err) {
+          console.error('Error fetching thumbnail from Telegram:', err);
+        }
+      }
+      
       return song;
     }));
 
