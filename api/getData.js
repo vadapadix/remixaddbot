@@ -1,18 +1,25 @@
 const Redis = require('ioredis');
 
 function getRedisUrl() {
-  const direct = process.env.KV_REDIS_URL ||
-                 process.env.REDIS_URL || 
-                 process.env.KV_URL || 
-                 process.env.STORAGE_URL || 
-                 process.env.STORAGE_REDIS_URL || 
-                 process.env.UPSTASH_REDIS_URL;
-  if (direct) return direct;
+  const candidates = [
+    { name: 'KV_REDIS_URL', val: process.env.KV_REDIS_URL },
+    { name: 'REDIS_URL', val: process.env.REDIS_URL },
+    { name: 'KV_URL', val: process.env.KV_URL },
+    { name: 'STORAGE_URL', val: process.env.STORAGE_URL },
+    { name: 'STORAGE_REDIS_URL', val: process.env.STORAGE_REDIS_URL },
+    { name: 'UPSTASH_REDIS_URL', val: process.env.UPSTASH_REDIS_URL },
+  ];
 
-  // Auto-detect any environment variable starting with redis:// or rediss://
+  for (const c of candidates) {
+    if (c.val && (c.val.startsWith('redis://') || c.val.startsWith('rediss://'))) {
+      console.log(`[REDIS] Using ${c.name}`);
+      return c.val;
+    }
+  }
+
   for (const [key, value] of Object.entries(process.env)) {
     if (typeof value === 'string' && (value.startsWith('redis://') || value.startsWith('rediss://'))) {
-      console.log(`Auto-detected Redis URL in process.env.${key}`);
+      console.log(`[REDIS] Auto-detected Redis URL in process.env.${key}`);
       return value;
     }
   }
@@ -24,15 +31,29 @@ const redisUrl = getRedisUrl();
 let redis = null;
 if (redisUrl) {
   try {
-    redis = new Redis(redisUrl, {
-      family: 4, // Force IPv4
-      connectTimeout: 5000,
+    const isTls = redisUrl.startsWith('rediss://');
+    try {
+      const parsed = new URL(redisUrl);
+      console.log(`[REDIS] Target: ${parsed.protocol}//${parsed.username ? parsed.username + '@' : ''}${parsed.hostname}:${parsed.port}`);
+    } catch (e) {}
+
+    const redisOptions = {
+      connectTimeout: 10000,
       maxRetriesPerRequest: 1,
+      enableReadyCheck: false,
       retryStrategy(times) {
-        if (times > 2) return null; // Stop reconnecting after 2 attempts
+        if (times > 2) return null;
         return 1000;
       },
-    });
+    };
+
+    if (isTls) {
+      redisOptions.tls = {
+        rejectUnauthorized: false,
+      };
+    }
+
+    redis = new Redis(redisUrl, redisOptions);
 
     redis.on('error', (err) => {
       console.error('Redis Client Error:', err.message);
@@ -41,7 +62,7 @@ if (redisUrl) {
     console.error('Failed to initialize Redis client:', err.message);
   }
 } else {
-  console.warn('REDIS_URL or KV_URL environment variable is not defined.');
+  console.warn('No Redis URL environment variable found.');
 }
 
 module.exports = async (req, res) => {
