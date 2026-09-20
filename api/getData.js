@@ -1,13 +1,31 @@
 const Redis = require('ioredis');
-const redis = new Redis(process.env.REDIS_URL, {
-  family: 4, // Force IPv4, Vercel sometimes has issues with IPv6 routing to Redis
-  connectTimeout: 10000,
-});
 
-redis.on('error', (err) => console.error('Redis Client Error', err));
+const redisUrl = process.env.REDIS_URL || process.env.KV_URL || process.env.UPSTASH_REDIS_URL;
+
+let redis = null;
+if (redisUrl) {
+  try {
+    redis = new Redis(redisUrl, {
+      family: 4, // Force IPv4
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 1,
+      retryStrategy(times) {
+        if (times > 2) return null; // Stop reconnecting after 2 attempts
+        return 1000;
+      },
+    });
+
+    redis.on('error', (err) => {
+      console.error('Redis Client Error:', err.message);
+    });
+  } catch (err) {
+    console.error('Failed to initialize Redis client:', err.message);
+  }
+} else {
+  console.warn('REDIS_URL or KV_URL environment variable is not defined.');
+}
 
 module.exports = async (req, res) => {
-  // Allow CORS for the desktop app if necessary, though desktop apps ignore CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   
   if (req.method !== 'GET') {
@@ -19,26 +37,36 @@ module.exports = async (req, res) => {
     return res.status(400).json({ error: 'Session ID is required' });
   }
 
+  if (!redis) {
+    return res.status(503).json({ 
+      error: 'Redis database not configured', 
+      details: 'Please set REDIS_URL in Vercel project environment variables.' 
+    });
+  }
+
   try {
     const sessionKey = `session:${sessionId}`;
-    const songsData = await redis.get(sessionKey);
+    let songsData = null;
+    try {
+      songsData = await redis.get(sessionKey);
+    } catch (redisErr) {
+      console.error('Redis GET failed:', redisErr.message);
+      return res.status(503).json({ 
+        error: 'Database connection failed', 
+        details: redisErr.message 
+      });
+    }
+
     let songs = [];
     if (songsData) {
-        try {
-            songs = JSON.parse(songsData);
-        } catch(e) {}
+      try {
+        songs = JSON.parse(songsData);
+      } catch(e) {}
     }
 
     if (!songs || songs.length === 0) {
       return res.status(200).json({ songs: [] });
     }
-
-    // We have songs! Before returning them to the client, 
-    // let's get the direct download links from Telegram if the client needs them.
-    // The Desktop app needs to download the file. 
-    // It can use the Telegram Bot API `getFile` method itself IF it has the Bot Token, 
-    // BUT we don't want to expose the Bot Token in the desktop app.
-    // So the serverless function will resolve the file_id to a direct URL.
 
     const botToken = process.env.TELEGRAM_BOT_TOKEN;
     
@@ -76,11 +104,15 @@ module.exports = async (req, res) => {
     }));
 
     // Clear the songs from the KV store so we don't download them twice
-    await redis.del(sessionKey);
+    try {
+      await redis.del(sessionKey);
+    } catch (delErr) {
+      console.error('Redis DEL failed:', delErr.message);
+    }
 
     return res.status(200).json({ songs: resolvedSongs });
   } catch (error) {
     console.error('Error in getData:', error);
-    return res.status(500).json({ error: 'Internal Server Error' });
+    return res.status(500).json({ error: 'Internal Server Error', details: error.message });
   }
 };
