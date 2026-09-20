@@ -1,7 +1,26 @@
 const { Telegraf } = require('telegraf');
 const Redis = require('ioredis');
 
-const redisUrl = process.env.REDIS_URL || process.env.KV_URL || process.env.UPSTASH_REDIS_URL;
+function getRedisUrl() {
+  const direct = process.env.KV_REDIS_URL ||
+                 process.env.REDIS_URL || 
+                 process.env.KV_URL || 
+                 process.env.STORAGE_URL || 
+                 process.env.STORAGE_REDIS_URL || 
+                 process.env.UPSTASH_REDIS_URL;
+  if (direct) return direct;
+
+  // Auto-detect any environment variable starting with redis:// or rediss://
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === 'string' && (value.startsWith('redis://') || value.startsWith('rediss://'))) {
+      console.log(`Auto-detected Redis URL in process.env.${key}`);
+      return value;
+    }
+  }
+  return null;
+}
+
+const redisUrl = getRedisUrl();
 
 let redis = null;
 if (redisUrl) {
