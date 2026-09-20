@@ -32,12 +32,15 @@ let redis = null;
 if (redisUrl) {
   try {
     const isTls = redisUrl.startsWith('rediss://');
-    try {
-      const parsed = new URL(redisUrl);
-      console.log(`[REDIS] Target: ${parsed.protocol}//${parsed.username ? parsed.username + '@' : ''}${parsed.hostname}:${parsed.port}`);
-    } catch (e) {}
+    const parsed = new URL(redisUrl);
+    console.log(`[REDIS] Target: ${parsed.protocol}//${parsed.username ? parsed.username + '@' : ''}${parsed.hostname}:${parsed.port}`);
 
     const redisOptions = {
+      host: parsed.hostname,
+      port: Number(parsed.port) || 6379,
+      username: parsed.username ? decodeURIComponent(parsed.username) : undefined,
+      password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+      family: 4, // Force IPv4 on Vercel/Lambda to avoid IPv6 routing hang
       connectTimeout: 10000,
       maxRetriesPerRequest: 1,
       enableReadyCheck: false,
@@ -47,13 +50,18 @@ if (redisUrl) {
       },
     };
 
+    if (parsed.pathname && parsed.pathname.length > 1) {
+      const dbNum = parseInt(parsed.pathname.slice(1), 10);
+      if (!isNaN(dbNum)) redisOptions.db = dbNum;
+    }
+
     if (isTls) {
       redisOptions.tls = {
         rejectUnauthorized: false,
       };
     }
 
-    redis = new Redis(redisUrl, redisOptions);
+    redis = new Redis(redisOptions);
 
     redis.on('error', (err) => {
       console.error('Redis Client Error:', err.message);
