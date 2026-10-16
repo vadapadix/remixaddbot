@@ -1,270 +1,73 @@
 const { Telegraf } = require('telegraf');
-const Redis = require('ioredis');
-
-function getRedisUrl() {
-  const candidates = [
-    { name: 'KV_REDIS_URL', val: process.env.KV_REDIS_URL },
-    { name: 'REDIS_URL', val: process.env.REDIS_URL },
-    { name: 'KV_URL', val: process.env.KV_URL },
-    { name: 'STORAGE_URL', val: process.env.STORAGE_URL },
-    { name: 'STORAGE_REDIS_URL', val: process.env.STORAGE_REDIS_URL },
-    { name: 'UPSTASH_REDIS_URL', val: process.env.UPSTASH_REDIS_URL },
-  ];
-
-  for (const c of candidates) {
-    if (c.val && (c.val.startsWith('redis://') || c.val.startsWith('rediss://'))) {
-      console.log(`[REDIS] Using ${c.name}`);
-      return c.val;
-    }
-  }
-
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === 'string' && (value.startsWith('redis://') || value.startsWith('rediss://'))) {
-      console.log(`[REDIS] Auto-detected Redis URL in process.env.${key}`);
-      return value;
-    }
-  }
-  return null;
-}
-
-const redisUrl = getRedisUrl();
-
-let redis = null;
-if (redisUrl) {
-  try {
-    const isTls = redisUrl.startsWith('rediss://');
-    const parsed = new URL(redisUrl);
-    console.log(`[REDIS] Target: ${parsed.protocol}//${parsed.username ? parsed.username + '@' : ''}${parsed.hostname}:${parsed.port}`);
-
-    const redisOptions = {
-      host: parsed.hostname,
-      port: Number(parsed.port) || 6379,
-      username: parsed.username ? decodeURIComponent(parsed.username) : undefined,
-      password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
-      family: 4, // Force IPv4 on Vercel/Lambda to avoid IPv6 routing hang
-      connectTimeout: 10000,
-      maxRetriesPerRequest: 1,
-      enableReadyCheck: false,
-      retryStrategy(times) {
-        if (times > 2) return null;
-        return 1000;
-      },
-    };
-
-    if (parsed.pathname && parsed.pathname.length > 1) {
-      const dbNum = parseInt(parsed.pathname.slice(1), 10);
-      if (!isNaN(dbNum)) redisOptions.db = dbNum;
-    }
-
-    if (isTls) {
-      redisOptions.tls = {
-        rejectUnauthorized: false,
-      };
-    }
-
-    redis = new Redis(redisOptions);
-
-    redis.on('error', (err) => {
-      console.error('Redis Client Error:', err.message);
-    });
-  } catch (err) {
-    console.error('Failed to initialize Redis client:', err.message);
-  }
-} else {
-  console.warn('No Redis URL environment variable found.');
-}
+const { getRedis } = require('../lib/redis');
+const { enqueue } = require('../lib/import-queue');
+const { SESSION_TTL, isSession, validWebhookSecret } = require('../lib/import-security');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
 
-// Helper to check redis before command execution
-function checkRedis(ctx) {
-  if (!redis) {
-    ctx.reply('⚠️ База даних Redis не налаштована або недоступна на сервері. Перевірте REDIS_URL у налаштуваннях Vercel.');
-    return false;
+bot.start(async ctx => {
+  const session = ctx.startPayload;
+  if (ctx.chat.type !== 'private' || !isSession(session))
+    return ctx.reply('Відкрийте підключення Telegram із поточної версії REMIX.');
+  const redis = getRedis();
+  const ownerKey = `owner:${session}`;
+  const owner = String(ctx.chat.id);
+  await redis.set(ownerKey, owner, 'EX', SESSION_TTL, 'NX');
+  if (await redis.get(ownerKey) !== owner) return ctx.reply('Ця сесія вже підключена до іншого користувача.');
+  await redis.set(`chat:${ctx.chat.id}`, session, 'EX', SESSION_TTL);
+  return ctx.reply('✅ REMIX підключено. Надішліть аудіо для імпорту. Для підключення каналу: /linkchannel');
+});
+
+bot.command('linkchannel', async ctx => {
+  if (ctx.chat.type !== 'private') return;
+  const session = await getRedis().get(`chat:${ctx.chat.id}`);
+  if (!isSession(session)) return ctx.reply('Спочатку підключіть REMIX.');
+  // Explicit capability replaces the global last-user-session cross-account mapping.
+  return ctx.reply(`Додайте бота адміністратором каналу та надішліть у каналі команду:\n/confirmchannel ${session}\nНе передавайте цю команду стороннім.`);
+});
+
+bot.command('confirmchannel', async ctx => {
+  if (ctx.chat.type !== 'channel') return ctx.reply('Надішліть команду з каналу.');
+  const text = ctx.channelPost?.text || ctx.message?.text || '';
+  const session = text.trim().split(/\s+/)[1];
+  if (!isSession(session) || !await getRedis().get(`owner:${session}`))
+    return ctx.reply('Отримайте нову команду через /linkchannel у приватному чаті.');
+  await getRedis().set(`channel:${ctx.chat.id}`, session, 'EX', SESSION_TTL);
+  return ctx.reply('✅ Канал підключено до REMIX.');
+});
+
+async function receiveAudio(ctx) {
+  const audio = ctx.message?.audio || ctx.channelPost?.audio;
+  if (!audio) return;
+  const channel = ctx.chat.type === 'channel';
+  const redis = getRedis();
+  const session = await redis.get(`${channel ? 'channel' : 'chat'}:${ctx.chat.id}`);
+  if (!isSession(session) || !await redis.get(`owner:${session}`)) {
+    if (!channel) await ctx.reply('Спочатку підключіть REMIX.');
+    return;
   }
-  return true;
+  await enqueue(redis, session, `${ctx.chat.id}:${ctx.message?.message_id || ctx.channelPost?.message_id}`, {
+    file_id: audio.file_id, title: audio.title || 'Невідома назва', performer: audio.performer || 'Невідомий виконавець',
+    duration: audio.duration, mime_type: audio.mime_type, file_name: audio.file_name, file_size: audio.file_size,
+    thumb_file_id: audio.thumbnail?.file_id || audio.thumb?.file_id || null, timestamp: Date.now()
+  });
+  if (!channel) await ctx.reply('🎵 Трек додано до черги REMIX.');
 }
+bot.on('channel_post', receiveAudio);
+bot.on('audio', receiveAudio);
 
-// Handle /start command with payload (e.g., /start 1167)
-bot.start(async (ctx) => {
-  const sessionId = ctx.startPayload; // The '1167' part in t.me/remixbot?start=1167
-  const chatId = ctx.chat.id;
-  
-  if (!checkRedis(ctx)) return;
-
-  if (sessionId) {
-    try {
-      // Save the mapping from this user's chat to the desktop session ID
-      await redis.set(`chat:${chatId}`, sessionId);
-      // Remember the latest active session for channel linking
-      await redis.set(`last-user-session`, sessionId);
-      await ctx.reply(`✅ Зв'язок встановлено! (Сесія: ${sessionId})\n\nТепер просто відправте або перешліть мені пісні (аудіо файли), і я передам їх у застосунок REMIX.\n\nДля підключення каналу: /linkchannel`);
-    } catch (err) {
-      console.error('Redis error in /start:', err.message);
-      await ctx.reply('❌ Помилка збереження сесії в Redis. Перевірте з\'єднання з базою даних.');
-    }
-  } else {
-    await ctx.reply('Привіт! Я бот для застосунку REMIX. Щоб підключити мене, використайте посилання безпосередньо з додатку.');
-  }
-});
-
-// Handle /linkchannel command — link a Telegram channel to a REMIX session
-bot.command('linkchannel', async (ctx) => {
-  if (!checkRedis(ctx)) return;
-  const chatId = ctx.chat.id;
-  try {
-    const sessionId = await redis.get(`chat:${chatId}`);
-    
-    if (!sessionId) {
-      return ctx.reply('❌ Спочатку підключіть бота через застосунок REMIX (зайдіть через посилання з додатку).');
-    }
-    
-    await ctx.reply(
-      '📡 Щоб підключити канал:\n\n' +
-      '1. Додайте цього бота як адміністратора до каналу\n' +
-      '2. Надішліть /confirmchannel з каналу\n\n' +
-      'Бот автоматично почне отримувати аудіо з підключеного каналу.'
-    );
-  } catch (err) {
-    console.error('Redis error in /linkchannel:', err.message);
-    await ctx.reply('❌ Помилка зв\'язку з базою даних.');
-  }
-});
-
-// Handle /confirmchannel — called from the channel itself to link it
-bot.command('confirmchannel', async (ctx) => {
-  if (!checkRedis(ctx)) return;
-  const chatId = ctx.chat.id;
-  const chatType = ctx.chat.type;
-  
-  if (chatType !== 'channel') {
-    return ctx.reply('❌ Ця команда повинна бути надіслана з каналу.');
-  }
-  
-  try {
-    const activeSession = await redis.get(`last-user-session`);
-    if (!activeSession) {
-      return ctx.reply('❌ Не знайдено активну сесію REMIX. Спочатку підключіть бота в приватному чаті.');
-    }
-    
-    await redis.set(`channel:${chatId}`, activeSession);
-    await redis.set(`channel-session:${chatId}`, activeSession);
-    
-    try {
-      await ctx.telegram.sendMessage(
-        parseInt(activeSession.split('-')[0]), 
-        '📡 Канал успішно підключено! Аудіо з каналу буде автоматично імпортуватись.'
-      );
-    } catch(e) {}
-  } catch (err) {
-    console.error('Redis error in /confirmchannel:', err.message);
-  }
-});
-
-// Handle channel posts with audio (bot added as admin to channel)
-bot.on('channel_post', async (ctx) => {
-  if (!redis) return;
-  const channelPost = ctx.channelPost;
-  if (!channelPost?.audio) return;
-  
-  const chatId = ctx.chat.id;
-  try {
-    let sessionId = await redis.get(`channel:${chatId}`);
-    if (!sessionId) return;
-    
-    const audio = channelPost.audio;
-    const songData = {
-      file_id: audio.file_id,
-      title: audio.title || 'Невідома назва',
-      performer: audio.performer || 'Невідомий виконавець',
-      duration: audio.duration,
-      mime_type: audio.mime_type,
-      file_name: audio.file_name,
-      file_size: audio.file_size,
-      thumb_file_id: audio.thumb?.file_id || null,
-      source: 'telegram_channel',
-      timestamp: Date.now()
-    };
-    
-    const sessionKey = `session:${sessionId}`;
-    let songsData = await redis.get(sessionKey);
-    let songs = [];
-    if (songsData) {
-      try { songs = JSON.parse(songsData); } catch(e) {}
-    }
-    
-    songs.push(songData);
-    await redis.set(sessionKey, JSON.stringify(songs), 'EX', 86400);
-  } catch (err) {
-    console.error('Redis error in channel_post:', err.message);
-  }
-});
-
-// Handle incoming audio files (direct messages and forwards)
-bot.on('audio', async (ctx) => {
-  if (!checkRedis(ctx)) return;
-  const chatId = ctx.chat.id;
-  const chatType = ctx.chat.type;
-  
-  try {
-    let sessionId;
-    if (chatType === 'channel') {
-      sessionId = await redis.get(`channel:${chatId}`);
-      if (!sessionId) {
-        sessionId = await redis.get(`channel-session:${chatId}`);
-      }
-    } else {
-      sessionId = await redis.get(`chat:${chatId}`);
-    }
-    
-    if (!sessionId) {
-      return ctx.reply('❌ Спочатку підключіть бота через застосунок REMIX.');
-    }
-    
-    const audio = ctx.message?.audio || ctx.channelPost?.audio;
-    if (!audio) return;
-    
-    const songData = {
-      file_id: audio.file_id,
-      title: audio.title || 'Невідома назва',
-      performer: audio.performer || 'Невідомий виконавець',
-      duration: audio.duration,
-      mime_type: audio.mime_type,
-      file_name: audio.file_name,
-      file_size: audio.file_size,
-      thumb_file_id: audio.thumb?.file_id || null,
-      source: chatType === 'channel' ? 'telegram_channel' : 'telegram',
-      timestamp: Date.now()
-    };
-    
-    const sessionKey = `session:${sessionId}`;
-    let songsData = await redis.get(sessionKey);
-    let songs = [];
-    if (songsData) {
-      try {
-        songs = JSON.parse(songsData);
-      } catch(e) {}
-    }
-    
-    songs.push(songData);
-    await redis.set(sessionKey, JSON.stringify(songs), 'EX', 86400);
-    
-    await ctx.reply(`🎵 Трек "${songData.performer} - ${songData.title}" успішно відправлено в REMIX!`);
-  } catch (err) {
-    console.error('Redis error in audio handler:', err.message);
-    await ctx.reply('❌ Не вдалося зберегти трек. Перевірте з\'єднання з базою даних Redis.');
-  }
-});
-
-// For Vercel Serverless Function
 module.exports = async (req, res) => {
+  if (req.method !== 'POST') return res.status(405).send('Method not allowed');
+  const expected = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (!expected) return res.status(503).send('Webhook is not configured');
+  if (!validWebhookSecret(req.headers?.['x-telegram-bot-api-secret-token'], expected))
+    return res.status(401).send('Unauthorized');
   try {
-    if (req.method === 'POST') {
-      await bot.handleUpdate(req.body);
-    }
-    res.status(200).send('OK');
-  } catch (error) {
-    console.error('Webhook error:', error);
-    res.status(500).send('Error');
+    await bot.handleUpdate(req.body);
+    return res.status(200).send('OK');
+  } catch {
+    // Provider exceptions may include credential-bearing URLs. Do not log them.
+    console.error('Telegram update failed');
+    return res.status(503).send('Retry later');
   }
 };

@@ -1,122 +1,37 @@
-# REMIX Telegram Bot
+# REMIX Telegram import backend
 
-Цей бот створений для того, щоб передавати аудіофайли з Telegram безпосередньо у десктопний застосунок REMIX. 
-Він базується на Node.js та розгортається на Vercel (через Serverless Functions). Для зберігання тимчасових даних між запитами клієнта та телеграму використовується Upstash Redis.
+Node.js 20+, Vercel functions and Redis over TLS. This directory is a separate Git submodule.
 
-## Як це працює?
-1. Застосунок REMIX генерує унікальний ідентифікатор сесії (наприклад, `1167` або `GUID`).
-2. Користувач переходить за посиланням: `https://t.me/YourRemixBot?start=1167`.
-3. Застосунок REMIX починає опитувати API бота кожні 2-3 секунди за адресою: `https://your-vercel-app.vercel.app/api/getData?session=1167`.
-4. Користувач натискає "Start" у боті та відправляє аудіофайли.
-5. Бот отримує аудіофайли, витягує метадані та тимчасово зберігає їх у базі даних (Upstash Redis).
-6. Коли клієнт REMIX здійснює черговий запит до `/api/getData`, він отримує список пісень разом з прямими посиланнями на завантаження, після чого дані видаляються з бази.
+## Protocol
 
-## Як розгорнути на Vercel
+1. Desktop generates a cryptographically random 256-bit session (64 hexadecimal characters) and opens the bot deep link.
+2. `/start` pairs the private chat with that session for 24 hours. A session cannot be claimed by a second chat.
+3. Webhook enqueues messages atomically in a Redis hash; message IDs and expiring deduplication keys make webhook retries idempotent.
+4. Desktop polls `GET /api/getData` with `Authorization: Bearer <session>`. Polling does not remove messages.
+5. The response contains 15-minute signed `/api/download?token=...` URLs. The server streams Telegram files; the Telegram bot credential never appears in client responses or redirects.
+6. After importing a track, desktop sends `POST /api/ack`, the same bearer header, and JSON `{ "ids": ["chatId:messageId"] }`. Only selected messages are removed.
 
-### Крок 1. Створення Telegram Бота
-1. Знайдіть у Telegram бота [@BotFather](https://t.me/BotFather).
-2. Напишіть йому `/newbot` і дотримуйтесь інструкцій, щоб отримати **Bot Token** (наприклад, `123456789:ABCdefGHIjkl...`).
+Queue/deduplication retention is 24 hours. This is retryable, at-least-once delivery; durable exactly-once insertion into the desktop library is not claimed. Old 8-character sessions and legacy Redis arrays are not read by the new protocol: reconnect and resend pending files during migration.
 
-### Крок 2. Підготовка Vercel
-1. Зареєструйтесь або увійдіть на [Vercel](https://vercel.com).
-2. Встановіть Vercel CLI (опціонально, але зручно): `npm i -g vercel`.
-3. У папці з цим проєктом (`remix-telegram-bot`) відкрийте термінал та запустіть команду:
-   ```bash
-   vercel
-   ```
-4. Пройдіть процес ініціалізації (виберіть поточну папку, налаштування за замовчуванням).
-5. Перейдіть у панель керування вашим проєктом на Vercel.
+Channel pairing uses an explicit session-bearing `/confirmchannel` command obtained in the owner's private chat. There is no global last-user mapping. Treat pairing commands as credentials.
 
-### Крок 3. Налаштування Бази Даних (Redis)
-1. Оскільки ви вже маєте `REDIS_URL`, перейдіть у панелі проєкту Vercel до **Settings -> Environment Variables**.
-2. Створіть змінну `REDIS_URL` та вставте туди вашу стрічку: `redis://default:KEs1...`.
+## Deployment requirements
 
-### Крок 4. Додавання Bot Token
-1. У панелі проєкту Vercel перейдіть до **Settings -> Environment Variables**.
-2. Створіть нову змінну з назвою `TELEGRAM_BOT_TOKEN` і вставте туди токен від BotFather.
+- `TELEGRAM_BOT_TOKEN`: server-only bot credential.
+- `TELEGRAM_WEBHOOK_SECRET`: independent random secret. Configure Telegram's webhook with the same `secret_token`; the server rejects a missing or incorrect `X-Telegram-Bot-Api-Secret-Token` header.
+- `REDIS_URL` or one of the Redis URL variables supported by `lib/redis.js`. Use trusted TLS certificates; certificate validation stays enabled.
+- `PUBLIC_BASE_URL`: public HTTPS origin without trailing slash, for example `https://remix-telegram-bot.vercel.app`. It must match the deployment trusted by the desktop client.
 
-### Крок 5. Встановлення Webhook
-Щоб Telegram знав, куди надсилати повідомлення вашому боту, потрібно зареєструвати вебхук.
-Виконайте такий запит у браузері або через `curl`, підставивши свої дані:
-```
-https://api.telegram.org/bot<ВАШ_TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<ВАШ_ДОМЕН_НА_VERCEL>/api/webhook
-```
-*Замініть `<ВАШ_TELEGRAM_BOT_TOKEN>` на токен і `<ВАШ_ДОМЕН_НА_VERCEL>` на домен, який Vercel видав вашому проєкту (наприклад, `remix-bot.vercel.app`).*
-Якщо все успішно, ви побачите відповідь `{"ok":true,"result":true,"description":"Webhook was set"}`.
+Install dependencies with `npm install` in this directory and deploy the updated functions together. No deployment or webhook reconfiguration is performed by source changes. If an earlier deployed version returned Telegram credential-bearing file URLs, rotate the bot token after closing that exposure and update the server environment.
 
-## Як інтегрувати в клієнт C# (Avalonia)
+Deploy this backend together with the desktop protocol update. Confirm webhook delivery, real Redis Lua enqueue/dedup/ack, and file streaming before publishing the client. Verify your hosting plan's body/streaming limits and function timeouts for large audio; use an appropriate streaming host if necessary. Do not replace the proxy with a redirect to Telegram file URLs.
 
-У вашому клієнті C# (наприклад, по кліку "Додати з Telegram") ви можете використати наступний код:
+## Tests
 
-```csharp
-using System;
-using System.Diagnostics;
-using System.Net.Http;
-using System.Text.Json;
-using System.Threading.Tasks;
+From the parent REMIX repository:
 
-public class TelegramImportService
-{
-    private readonly HttpClient _httpClient = new HttpClient();
-    private const string VercelAppUrl = "https://remix-telegram-bot.vercel.app"; // Адреса вашого Vercel
-    private const string BotUsername = "remixx_bot"; // Ваш Telegram бот
-
-    public async Task StartImportFlowAsync()
-    {
-        // 1. Генеруємо унікальну сесію
-        string sessionId = Guid.NewGuid().ToString().Substring(0, 8);
-        
-        // 2. Відкриваємо посилання у браузері користувача
-        string telegramUrl = $"https://t.me/{BotUsername}?start={sessionId}";
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = telegramUrl,
-            UseShellExecute = true
-        });
-
-        // 3. Починаємо поллінг даних кожні 3 секунди
-        bool isImporting = true;
-        while (isImporting)
-        {
-            await Task.Delay(3000);
-            
-            try
-            {
-                string apiUrl = $"{VercelAppUrl}/api/getData?session={sessionId}";
-                var response = await _httpClient.GetAsync(apiUrl);
-                
-                if (response.IsSuccessStatusCode)
-                {
-                    string json = await response.Content.ReadAsStringAsync();
-                    using var doc = JsonDocument.Parse(json);
-                    
-                    var songsElement = doc.RootElement.GetProperty("songs");
-                    if (songsElement.GetArrayLength() > 0)
-                    {
-                        foreach (var song in songsElement.EnumerateArray())
-                        {
-                            string title = song.GetProperty("title").GetString();
-                            string performer = song.GetProperty("performer").GetString();
-                            string downloadUrl = song.GetProperty("download_url").GetString();
-                            
-                            Console.WriteLine($"Отримано: {performer} - {title}");
-                            // TODO: Завантажити файл за downloadUrl та додати в плейлист REMIX
-                            
-                            // Завантаження файлу:
-                            // byte[] audioData = await _httpClient.GetByteArrayAsync(downloadUrl);
-                            // await File.WriteAllBytesAsync($"C:\\Music\\{performer} - {title}.mp3", audioData);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Помилка: {ex.Message}");
-            }
-        }
-    }
-}
+```powershell
+node --test Tests/telegram/import.test.cjs
 ```
 
-## Додаткові зауваження
-Обмеження Telegram Bot API на розмір файлу для завантаження становить 20 МБ. Більшість пісень поміщаються в цей ліміт.
+These tests exercise injected HTTP handlers, signatures and acknowledgement behavior without production credentials, Redis or Telegram. A live Redis/deployment smoke check is still required before release.
