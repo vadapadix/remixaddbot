@@ -49,9 +49,22 @@ async function receiveAudio(ctx) {
     if (!channel) await ctx.reply('Спочатку підключіть REMIX.');
     return;
   }
+  // Resolve the file path once, at enqueue time: every later download then streams
+  // straight from the cached path instead of hammering getFile (which Telegram
+  // rate-limits under retry storms).
+  let filePath = null;
+  try {
+    const meta = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(audio.file_id)}`, { signal: AbortSignal.timeout(15000) });
+    const data = await meta.json();
+    if (data.ok && typeof data.result?.file_path === 'string' && /^[\w/.-]+$/.test(data.result.file_path))
+      filePath = data.result.file_path;
+    else if ((data.description || '').includes('file is too big'))
+      return ctx.reply('⚠️ Файл більший за 20 МБ — Bot API Telegram не дозволяє його завантажити.');
+  } catch { }
   await enqueue(redis, session, `${ctx.chat.id}:${ctx.message?.message_id || ctx.channelPost?.message_id}`, {
     file_id: audio.file_id, title: audio.title || 'Невідома назва', performer: audio.performer || 'Невідомий виконавець',
     duration: audio.duration, mime_type: audio.mime_type, file_name: audio.file_name, file_size: audio.file_size,
+    file_path: filePath,
     thumb_file_id: audio.thumbnail?.file_id || audio.thumb?.file_id || null, timestamp: Date.now()
   });
   if (!channel) await ctx.reply('🎵 Трек додано до черги REMIX.');
