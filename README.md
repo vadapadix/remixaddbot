@@ -35,3 +35,28 @@ node --test Tests/telegram/import.test.cjs
 ```
 
 These tests exercise injected HTTP handlers, signatures and acknowledgement behavior without production credentials, Redis or Telegram. A live Redis/deployment smoke check is still required before release.
+
+## Diagnosing a silent /start
+
+A Ready deployment does not register a Telegram webhook. No function logs can also
+mean an early rejection: missing TELEGRAM_WEBHOOK_SECRET returns 503; a webhook
+registered without the matching secret header returns 401. These rejections now
+emit safe configuration/authentication diagnostics without credentials or chat data.
+
+1. In Vercel Production, configure TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET,
+   KV_REDIS_URL (or REDIS_URL), and PUBLIC_BASE_URL. The public origin for this
+   project is https://remix-telegram-bot.vercel.app.
+2. Redeploy: adding an environment variable does not update an existing deployment.
+3. Register the same origin's /api/webhook and secret with Telegram. In a private
+   environment containing these variables, run `npm run webhook:set`. This is an
+   explicit mutation; it preserves pending updates. Never paste credentials in chat
+   or into a command URL.
+4. Run `npm run webhook:info` with TELEGRAM_BOT_TOKEN and optionally PUBLIC_BASE_URL
+   in the environment. Check configured=true, matchesPublicBase=true, and delivery
+   errors/pending updates. Production-sensitive variables may be redacted by CLI
+   environment downloads; an empty downloaded value is not proof of an invalid token.
+5. Send /start from Telegram and check the accepted/configuration/rejected log event.
+   Plain /start should tell you to connect from REMIX; only a current 64-character
+   desktop deep-link session pairs the account. Do not remove webhook-secret validation.
+
+Additional regression tests: `node --test Tests/telegram/webhook.test.cjs` from the parent repository.

@@ -1,9 +1,12 @@
 const { Telegraf } = require('telegraf');
 const { getRedis } = require('../lib/redis');
 const { enqueue } = require('../lib/import-queue');
-const { SESSION_TTL, isSession, validWebhookSecret } = require('../lib/import-security');
+const { SESSION_TTL, isSession } = require('../lib/import-security');
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
+const { createWebhookHandler } = require('../lib/webhook-handler');
+
+function createBot() {
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 bot.start(async ctx => {
   const session = ctx.startPayload;
@@ -56,18 +59,12 @@ async function receiveAudio(ctx) {
 bot.on('channel_post', receiveAudio);
 bot.on('audio', receiveAudio);
 
-module.exports = async (req, res) => {
-  if (req.method !== 'POST') return res.status(405).send('Method not allowed');
-  const expected = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (!expected) return res.status(503).send('Webhook is not configured');
-  if (!validWebhookSecret(req.headers?.['x-telegram-bot-api-secret-token'], expected))
-    return res.status(401).send('Unauthorized');
-  try {
-    await bot.handleUpdate(req.body);
-    return res.status(200).send('OK');
-  } catch {
-    // Provider exceptions may include credential-bearing URLs. Do not log them.
-    console.error('Telegram update failed');
-    return res.status(503).send('Retry later');
+return bot;
+}
+let bot;
+module.exports = createWebhookHandler({
+  handleUpdate: async update => {
+    bot ||= createBot();
+    await bot.handleUpdate(update);
   }
-};
+});
