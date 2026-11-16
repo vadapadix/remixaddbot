@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Telegram bot for REMIX player to send songs from Telegram to the desktop app",
   "main": "api/webhook.js",
+  "engines": { "node": ">=20" },
   "scripts": {
     "start": "node api/webhook.js"
   },
